@@ -1,0 +1,180 @@
+name: Build Floppa 64 ROM
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/dragonminded/libdragon:latest
+    steps:
+      - name: Write project
+        run: |
+          mkdir -p proj
+          printf 'BUILD_DIR=build\ninclude $(N64_INST)/include/n64.mk\n\nall: floppa.z64\n\nOBJS = $(BUILD_DIR)/main.o\n\nfloppa.z64: N64_ROM_TITLE = "Raise a Floppa 64"\n\n$(BUILD_DIR)/floppa.elf: $(OBJS)\n\nclean:\n\trm -rf $(BUILD_DIR) *.z64\n\n.PHONY: all clean\n-include $(wildcard $(BUILD_DIR)/*.d)\n' > proj/Makefile
+          cat > proj/main.c <<'FLOPPA_EOF'
+          #include <libdragon.h>
+          #include <math.h>
+          #include <stdlib.h>
+          #include <stdio.h>
+
+          #define FOCAL 250.0f
+          typedef struct { float x[4], y[4], z; uint8_t r, g, b; } Poly;
+          typedef struct { float x, y, z, yaw, g; } Xf;
+          typedef struct { float x, y, z, vy, l; char ch[2]; } Fx;
+          enum { A_NONE, A_FEED, A_PET, A_PLAY };
+
+          static Poly polys[400]; static int np = 0;
+          static Fx fxs[24];
+          static float cA, sA;
+          static struct { float food, love, zzz, weight, actT, x, z, tx, tz, yaw, t, wt, pt, fish; int sleep, act, go, fed; } S;
+
+          static float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+          static void cam(float x, float y, float z, float *o) { y -= 4; z += 10; o[0] = x; o[1] = y * cA + z * sA; o[2] = -y * sA + z * cA; }
+          static void camn(float x, float y, float z, float *o) { o[0] = x; o[1] = y * cA + z * sA; o[2] = -y * sA + z * cA; }
+          static void fogc(const uint8_t *c, float z, float l, uint8_t *out) {
+            float f = clampf((z - 10) / 24, 0, 1); const float fog[3] = {190, 210, 250};
+            for (int i = 0; i < 3; i++) { float v = clampf(c[i] * l, 0, 255); out[i] = (uint8_t)(v + (fog[i] - v) * f); }
+          }
+          static void box(float cx, float cy, float cz, float sx, float sy, float sz, uint8_t cr, uint8_t cg, uint8_t cb, const Xf *T, float ys) {
+            static const int FC[5][4] = {{4,5,7,6},{0,2,3,1},{2,6,7,3},{1,3,7,5},{0,4,6,2}};
+            static const float N[5][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,0,1},{0,0,-1}};
+            float co = cosf(T->yaw), sn = sinf(T->yaw), V[8][3]; uint8_t base[3] = {cr, cg, cb};
+            for (int i = 0; i < 8; i++) {
+              float lx = (cx + sx * ((i & 4) ? 1 : -1)) * T->g, ly = (cy + sy * ((i & 2) ? 1 : -1)) * T->g * ys, lz = (cz + sz * ((i & 1) ? 1 : -1)) * T->g;
+              cam(T->x + lx * co + lz * sn, T->y + ly, T->z - lx * sn + lz * co, V[i]);
+            }
+            for (int f = 0; f < 5; f++) {
+              float *v[4] = {V[FC[f][0]], V[FC[f][1]], V[FC[f][2]], V[FC[f][3]]};
+              if (v[0][2] < .5f || v[1][2] < .5f || v[2][2] < .5f || v[3][2] < .5f) continue;
+              float nc[3]; camn(N[f][0] * co + N[f][2] * sn, N[f][1], -N[f][0] * sn + N[f][2] * co, nc);
+              float c0 = 0, c1 = 0, c2 = 0;
+              for (int k = 0; k < 4; k++) { c0 += v[k][0] / 4; c1 += v[k][1] / 4; c2 += v[k][2] / 4; }
+              if (nc[0] * c0 + nc[1] * c1 + nc[2] * c2 >= 0 || np >= 400) continue;
+              float l = (.5f + .5f * fmaxf(0, nc[0] * -.4f + nc[1] * .8f + nc[2] * -.45f)) * 1.1f;
+              Poly *p = &polys[np++]; uint8_t o[3];
+              for (int k = 0; k < 4; k++) { p->x[k] = clampf(160 + FOCAL * v[k][0] / v[k][2], -900, 900); p->y[k] = clampf(128 - FOCAL * v[k][1] / v[k][2], -900, 900); }
+              p->z = c2; fogc(base, c2, l, o); p->r = o[0]; p->g = o[1]; p->b = o[2];
+            }
+          }
+          static void quad(const float *x, const float *y) {
+            float a[2] = {x[0], y[0]}, b[2] = {x[1], y[1]}, c[2] = {x[2], y[2]}, d[2] = {x[3], y[3]};
+            rdpq_triangle(&TRIFMT_FILL, a, b, c); rdpq_triangle(&TRIFMT_FILL, a, c, d);
+          }
+          static int cmp(const void *a, const void *b) { float d = ((const Poly *)b)->z - ((const Poly *)a)->z; return d > 0 ? 1 : (d < 0 ? -1 : 0); }
+          static void fx(const char *ch) {
+            for (int i = 0; i < 24; i++) if (fxs[i].l <= 0) { fxs[i] = (Fx){S.x + ((rand() % 100) - 50) / 60.0f, 2.6f, S.z + .3f, 1.3f, 1.0f, {ch[0], 0}}; return; }
+          }
+          static void txt(float x, float y, const char *s, int center) {
+            rdpq_textparms_t p = {0}; if (center) { p.width = 320; p.align = ALIGN_CENTER; }
+            rdpq_text_print(&p, 1, x, y, s);
+          }
+          static void fillr(int r, int g, int b, int x0, int y0, int x1, int y1) { rdpq_set_mode_fill(RGBA32(r, g, b, 255)); rdpq_fill_rectangle(x0, y0, x1, y1); }
+          static void bar(const char *l, float v, int x, int y, int r, int g, int b) {
+            txt(x, y + 8, l, 0); fillr(255, 255, 255, x + 32, y - 1, x + 94, y + 9);
+            fillr(0, 0, 0, x + 33, y, x + 93, y + 8); if (v < 25) fillr(229, 57, 53, x + 33, y, x + 33 + (int)(.6f * v), y + 8); else fillr(r, g, b, x + 33, y, x + 33 + (int)(.6f * v), y + 8);
+          }
+          static void floppa(void) {
+            int sl = S.sleep; float gr = .55f + .6f * clampf((S.weight - 3) / 9, 0, 1), ys = sl ? .7f : 1;
+            float bob = sinf(S.t * (sl ? 1.5f : 3)) * .03f, jump = S.act == A_PLAY ? fabsf(sinf(S.t * 8)) * .9f : 0;
+            Xf T = {S.x, jump + bob, S.z, S.yaw, gr};
+            float e = (S.act == A_FEED && !S.fed) ? sinf(S.t * 14) * .12f : 0, hz = e, hy = -fabsf(e);
+            box(0,1.1f,0,.6f,.55f,1,222,176,112,&T,ys); box(0,.95f,.05f,.62f,.3f,.8f,240,214,170,&T,ys);
+            box(0,1.5f+hy,1.15f+hz,.65f,.5f,.45f,222,176,112,&T,ys); box(0,1.28f+hy,1.55f+hz,.34f,.16f,.1f,240,214,170,&T,ys);
+            box(0,1.38f+hy,1.64f+hz,.1f,.07f,.04f,240,120,150,&T,ys);
+            for (int k = -1; k <= 1; k += 2) {
+              box(.42f*k,2.08f+hy,1.05f+hz,.14f,.28f,.09f,222,176,112,&T,ys); box(.42f*k,2.48f+hy,1.05f+hz,.09f,.17f,.07f,25,20,20,&T,ys);
+              box(.26f*k,1.62f+hy,1.62f+hz,.1f,sl?.015f:.1f,.03f,25,20,20,&T,ys);
+              if (!sl) box(.24f*k,1.66f+hy,1.66f+hz,.035f,.035f,.02f,255,255,255,&T,ys);
+              box(.4f*k,.4f,.72f,.17f,.4f,.17f,190,145,90,&T,ys); box(.4f*k,.4f,-.72f,.17f,.4f,.17f,190,145,90,&T,ys);
+            }
+            box(0,1.3f,-1.3f,.1f,.1f,.35f,222,176,112,&T,ys); box(0,1.3f,-1.72f,.11f,.11f,.1f,25,20,20,&T,ys);
+          }
+          static void update(float dt) {
+            S.t += dt; if (!S.go) { S.yaw += dt * 1.2f; return; }
+            int sl = S.sleep; S.food -= dt * (sl ? .3f : .9f); S.love -= dt * (sl ? .1f : .7f); S.zzz += sl ? dt * 9 : -dt * .5f;
+            if (sl && S.zzz >= 100) S.sleep = 0;
+            if (S.act == A_PLAY) { S.love += dt * 13; S.zzz -= dt * 8; S.food -= dt * 4; }
+            if (S.act == A_PET) { S.love += dt * 26; S.pt -= dt; if (S.pt <= 0) { fx("<"); S.pt = .2f; } }
+            if (S.act == A_FEED) {
+              if (S.fish >= 0) S.fish += dt;
+              if (!S.fed && S.actT < .8f) { S.fed = 1; S.food += 32; S.weight += .35f; S.fish = -1; fx("*"); fx("*"); fx("*"); }
+            }
+            if (S.act) { S.actT -= dt; if (S.actT <= 0) { S.act = A_NONE; S.fish = -1; } }
+            if (sl && (rand() % 100) < dt * 120) fx("Z");
+            S.food = clampf(S.food, 0, 100); S.love = clampf(S.love, 0, 100); S.zzz = clampf(S.zzz, 0, 100);
+            float ty = S.yaw;
+            if (!S.act && !S.sleep) {
+              float dx = S.tx - S.x, dz = S.tz - S.z, d = sqrtf(dx * dx + dz * dz);
+              if (d > .1f) { float sp = S.food < 25 ? .5f : 1.2f; S.x += dx / d * sp * dt; S.z += dz / d * sp * dt; ty = atan2f(dx, dz); }
+              else { S.wt -= dt; if (S.wt <= 0) { S.tx = ((rand() % 100) - 50) / 12.5f; S.tz = (rand() % 100) / 25.0f; S.wt = 2 + (rand() % 30) / 10.0f; } }
+            } else ty = 3.14159f;
+            float df = ty - S.yaw; df = atan2f(sinf(df), cosf(df)); S.yaw += df * clampf(dt * 5, 0, 1);
+            for (int i = 0; i < 24; i++) if (fxs[i].l > 0) { fxs[i].y += fxs[i].vy * dt; fxs[i].l -= dt * .8f; }
+          }
+          static void act(int a) {
+            if (!S.go) { S.go = 1; return; }
+            if (S.act) return;
+            S.sleep = 0; S.act = a;
+            if (a == A_FEED) { S.actT = 1.6f; S.fed = 0; S.fish = 0; }
+            if (a == A_PET) { S.actT = 1.6f; S.pt = 0; }
+            if (a == A_PLAY) S.actT = 2.2f;
+          }
+          static void render(surface_t *disp) {
+            np = 0; rdpq_attach_clear(disp, NULL);
+            for (int i = 0; i < 9; i++) fillr(90 + i * 13, 120 + i * 11, 225 + i * 3, 0, i * 11, 320, i * 11 + 12);
+            fillr(66, 148, 74, 0, 84, 320, 240);
+            rdpq_set_mode_standard(); rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+            for (int zi = -2; zi < 8; zi++) for (int xi = -7; xi < 7; xi++) {
+              float x[4], y[4], zc = 0; float q[4][3]; float px[4][3] = {{xi*2,0,zi*2+2},{xi*2+2,0,zi*2+2},{xi*2+2,0,zi*2+4},{xi*2,0,zi*2+4}};
+              int ok = 1; for (int k = 0; k < 4; k++) { cam(px[k][0], px[k][1], px[k][2], q[k]); if (q[k][2] < .6f) ok = 0; zc += q[k][2] / 4; x[k] = clampf(160 + FOCAL * q[k][0] / q[k][2], -900, 900); y[k] = clampf(128 - FOCAL * q[k][1] / q[k][2], -900, 900); }
+              if (!ok) continue;
+              uint8_t c1[3] = {84, 168, 84}, c2[3] = {66, 148, 74}, o[3]; fogc(((xi + zi) & 1) ? c1 : c2, zc, 1, o);
+              rdpq_set_prim_color(RGBA32(o[0], o[1], o[2], 255)); quad(x, y);
+            }
+            Xf I = {0, 0, 0, 0, 1}; floppa();
+            box(0,.8f,9.5f,3.2f,.8f,.8f,170,60,70,&I,1); box(0,1.9f,10.2f,3.2f,.9f,.2f,150,50,60,&I,1);
+            box(-6.5f,.9f,7,.8f,.9f,.8f,150,100,60,&I,1); box(-6.5f,2.2f,7,.9f,.5f,.9f,60,170,70,&I,1); box(6.5f,.5f,6,.9f,.5f,.9f,235,230,215,&I,1);
+            if (S.fish >= 0) { Xf F2 = {S.x, fmaxf(1.7f, 5 - S.fish * 4.5f), S.z + .3f, S.fish * 6, 1}; box(0,0,0,.15f,.12f,.4f,110,170,225,&F2,1); box(0,0,-.5f,.04f,.15f,.12f,90,140,200,&F2,1); }
+            qsort(polys, np, sizeof(Poly), cmp);
+            for (int i = 0; i < np; i++) { rdpq_set_prim_color(RGBA32(polys[i].r, polys[i].g, polys[i].b, 255)); quad(polys[i].x, polys[i].y); }
+            if (!S.go) { fillr(0, 0, 0, 0, 40, 320, 74); txt(0, 62, "RAISE A FLOPPA 64", 1); if (((int)(S.t * 2)) & 1) { fillr(0, 0, 0, 0, 205, 320, 225); txt(0, 218, "PRESS START", 1); } }
+            else {
+              fillr(0, 0, 0, 0, 0, 320, 14); fillr(0, 0, 0, 0, 196, 320, 240);
+              char b[64]; const char *nm = S.weight < 4.5f ? "KITTEN FLOPPA" : S.weight < 8 ? "FLOPPA" : "BIG FLOPPA";
+              snprintf(b, sizeof b, "%s  %.1f KG", nm, S.weight); txt(6, 10, b, 0);
+              const char *m = S.sleep ? "ZZZ..." : S.food < 25 ? "FLOPPA HUNGRY!" : S.love < 25 ? "FLOPPA SAD..." : S.zzz < 20 ? "FLOPPA TIRED" : (S.food > 70 && S.love > 70 && S.zzz > 50) ? "FRIDAY!!!" : "FLOPPA OK";
+              txt(0, 208, m, 1);
+              bar("FOOD", S.food, 8, 214, 245, 166, 35); bar("LOVE", S.love, 112, 214, 255, 92, 154); bar("ZZZ", S.zzz, 216, 214, 74, 168, 255);
+              txt(0, 236, "A FEED  B PET  C-UP PLAY  START SLEEP", 1);
+            }
+            for (int i = 0; i < 24; i++) if (fxs[i].l > 0) {
+              float q[3]; cam(fxs[i].x, fxs[i].y, fxs[i].z, q); if (q[2] < 1) continue;
+              txt(160 + FOCAL * q[0] / q[2], 128 - FOCAL * q[1] / q[2], fxs[i].ch, 0);
+            }
+            rdpq_detach_show();
+          }
+          int main(void) {
+            cA = cosf(.32f); sA = sinf(.32f);
+            display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE);
+            rdpq_init(); joypad_init(); timer_init();
+            rdpq_text_register_font(1, rdpq_font_load_builtin(FONT_BUILTIN_DEBUG_MONO));
+            S.food = 70; S.love = 70; S.zzz = 80; S.weight = 3; S.z = 2; S.tz = 2; S.yaw = 3.14159f; S.fish = -1;
+            uint32_t last = get_ticks_ms();
+            while (1) {
+              uint32_t now = get_ticks_ms(); float dt = clampf((now - last) / 1000.0f, 0, .05f); last = now;
+              joypad_poll(); joypad_buttons_t p = joypad_get_buttons_pressed(JOYPAD_PORT_1);
+              if (p.start) { if (!S.go) S.go = 1; else if (S.act == A_NONE) S.sleep = !S.sleep; }
+              if (p.a) act(A_FEED); if (p.b) act(A_PET); if (p.c_up) act(A_PLAY);
+              update(dt);
+              surface_t *d = display_get(); render(d);
+            }
+          }
+          FLOPPA_EOF
+      - name: Build
+        working-directory: proj
+        run: make
+      - name: Upload ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: floppa64-rom
+          path: proj/floppa.z64
